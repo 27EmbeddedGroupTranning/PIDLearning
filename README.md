@@ -48,9 +48,10 @@ python lab.py
 ## 文件导航
 
 ```text
-src/tuning.cpp          ← 学生主要修改这里：两轴 PID 参数
-include/pid.hpp         ← PID 算法实现：进阶实验可修改
-src/main.cpp            ← 500 Hz 控制循环、双轴物理模型、CSV 输出
+src/tuning.cpp          ← 学生主要修改这里：两轴外环 PID 参数与内环 LQR 配置
+include/pid.hpp         ← 外环 PID 算法实现：进阶实验可修改
+include/lqr.hpp         ← 内环 LQR：速度环状态空间模型、Q/R 权重与 DARE 求解
+src/main.cpp            ← 500 Hz 双环控制循环（外环 PID → 速度指令，内环 LQR → 力矩）、双轴物理模型、CSV 输出
 lab.py                  ← 编译、运行和本地 HTTP 服务
 web/                    ← 云台动画、曲线和页面
 tests/                  ← 控制器测试、课程参数对照验证
