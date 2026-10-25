@@ -13,6 +13,7 @@ jobs:
           node-version: '22'
       - run: python lab.py --test
       - run: python tests/verify_lessons.py
+      - run: python tests/test_live.py
       - run: node --check web/app.js
       - run: cmake -S . -B build/cmake
       - run: cmake --build build/cmake

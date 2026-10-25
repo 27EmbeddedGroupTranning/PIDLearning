@@ -1,7 +1,9 @@
 "use strict";
 const $ = id => document.getElementById(id);
 const colors = {cyan: "#55dfcb", gold: "#ffc76a", purple: "#b5a2ff", white: "#e6edf3", grid: "#273747", muted: "#92a7b8"};
-let rows = [], previous = [], time = 0, playing = true, last = performance.now();
+let rows = [], time = 0, paused = false, after = 0, generation = -1;
+let sending = false, pending = null, compiling = false, connected = false, message = "";
+let session = null;
 function canvas(id) {
   const c = $(id), w = c.clientWidth, h = c.clientHeight, ratio = window.devicePixelRatio || 1;
   if (c.width !== Math.round(w * ratio) || c.height !== Math.round(h * ratio)) {
@@ -48,49 +50,97 @@ function plot(id, series, unit) {
   const {ctx,w,h}=canvas(id), left=50,right=w-12,top=16,bottom=h-28;
   const values=series.flatMap(s=>s.data.map(r=>r[s.key]));
   let min=Math.min(0,...values),max=Math.max(0,...values),pad=Math.max((max-min)*.12,.05);min-=pad;max+=pad;
-  const x=t=>left+t/15*(right-left), y=v=>bottom-(v-min)/(max-min)*(bottom-top);
+  const start=Math.max(0,time-15), end=Math.max(15,time);
+  const x=t=>left+(t-start)/(end-start)*(right-left), y=v=>bottom-(v-min)/(max-min)*(bottom-top);
   ctx.fillStyle=colors.muted;ctx.fillText(unit,3,11);
   for(let n=0;n<=4;n++) {const v=min+(max-min)*n/4;line(ctx,left,y(v),right,y(v),colors.grid);ctx.fillStyle=colors.muted;ctx.fillText(v.toFixed(max-min>10?0:2),2,y(v)+4);}
-  for(let t=0;t<=15;t+=3) {line(ctx,x(t),top,x(t),bottom,colors.grid);ctx.fillStyle=colors.muted;ctx.fillText(t+"s",x(t)-7,h-7);}
+  for(let n=0;n<=5;n++) {const t=start+n*3;line(ctx,x(t),top,x(t),bottom,colors.grid);ctx.fillStyle=colors.muted;ctx.fillText(t.toFixed(0)+"s",x(t)-7,h-7);}
   for(const s of series) {ctx.beginPath();ctx.strokeStyle=s.color;ctx.lineWidth=s.width||1.6;ctx.setLineDash(s.dash?[5,4]:[]);s.data.forEach((r,i)=>i?ctx.lineTo(x(r.time),y(r[s.key])):ctx.moveTo(x(r.time),y(r[s.key])));ctx.stroke();}
   ctx.setLineDash([]);line(ctx,x(time),top,x(time),bottom,"#ffffff66");
 }
-function metrics() {
-  const axis=$("axis").value, target=rows.find(r=>r.time>=1)[axis+"_target"];
-  const step=rows.filter(r=>r.time>=1&&r.time<6), sign=Math.sign(target);
-  const overshoot=target===0?"—":(Math.max(0,...step.map(r=>(r[axis]-target)*sign))/Math.abs(target)*100).toFixed(1)+"%";
-  const tail=rows.filter(r=>r.time>=14), mae=tail.reduce((sum,r)=>sum+Math.abs(r[axis+"_target"]-r[axis]),0)/tail.length;
-  $("metrics").textContent=`初次阶跃超调（1–6 s）：${overshoot}　末秒平均绝对误差：${mae.toFixed(2)}°`;
-}
 function draw() {
   if(!rows.length)return;
-  const r=rows[Math.min(rows.length-1,Math.round(time/.02))],axis=$("axis").value;
+  const r=rows[rows.length-1],axis=$("axis").value;
+  time=r.time;
   drawGimbal(r);
-  const series=[];if(previous.length)series.push({data:previous,key:axis,color:"#7d899c",dash:true});
-  series.push({data:rows,key:axis+"_target",color:colors.gold,dash:true},{data:rows,key:axis,color:colors.cyan});
-  plot("response",series,"角度 / °");
+  plot("response",[{data:rows,key:axis+"_target",color:colors.gold,dash:true},{data:rows,key:axis,color:colors.cyan}],"角度 / °");
   plot("terms",[{data:rows,key:axis+"_p",color:colors.cyan},{data:rows,key:axis+"_i",color:colors.gold},{data:rows,key:axis+"_d",color:colors.purple},{data:rows,key:axis+"_u",color:colors.white,width:2}],"力矩 / N·m");
   $("yawError").textContent=(r.yaw_target-r.yaw).toFixed(2)+"°";
   $("pitchError").textContent=(r.pitch_target-r.pitch).toFixed(2)+"°";
   $("torque").textContent=r.yaw_u.toFixed(3)+" N·m";
-  $("clock").textContent=time.toFixed(2)+" s";$("scrub").value=time;
-  $("play").textContent=playing?"暂停":"播放";
+  $("clock").textContent=time.toFixed(2)+" s";
+  const tail=rows.filter(sample=>sample.time>=time-1);
+  const mae=tail.reduce((sum,sample)=>sum+Math.abs(sample[axis+"_target"]-sample[axis]),0)/tail.length;
+  $("metrics").textContent=`${axis.toUpperCase()} 已应用目标：${r[axis+"_target"].toFixed(0)}°　最近 1 秒平均绝对误差：${mae.toFixed(2)}°`;
 }
-async function run() {
-  for(const id of ["yaw","pitch","load"])if(!$(id).reportValidity() || $(id).value==="")return;
-  $("run").disabled=true;playing=false;$("status").className="";$("status").textContent="正在编译 C++ 并计算 15 秒响应…";
+function showStatus() {
+  $("status").className=message?"error":"";
+  $("status").textContent=message || (compiling?"正在编译 C++，当前控制器继续运行…":!connected?"正在连接 C++ 控制器…":paused?"仿真已暂停 · 修改的目标将在继续后生效":"实时运行 · 拖动滑块即时下发目标 · C++ 固定步长 2 ms");
+  $("play").textContent=paused?"继续仿真":"暂停仿真";
+}
+async function post(path, data={}) {
+  const response=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data),signal:AbortSignal.timeout(70000)});
+  const result=await response.json();
+  if(!response.ok)throw new Error(result.error||"请求失败");
+  return result;
+}
+function labels() {
+  $("yawValue").textContent=$("yaw").value+"°";
+  $("pitchValue").textContent=$("pitch").value+"°";
+}
+// 合并尚未发出的滑块指令；最多一个请求在途，避免旧目标覆盖新目标。
+async function sendControl(update) {
+  pending={...(pending||{}),...update};
+  if(sending)return;
+  sending=true;
+  while(pending) {
+    const data=pending; pending=null;
+    try {await post("/api/control",data);message="";}
+    catch(error) {message="指令下发失败："+error.message;pending=null;}
+    showStatus();
+  }
+  sending=false;
+}
+async function poll() {
   try {
-    const response=await fetch("/api/run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({yaw:Number($("yaw").value),pitch:Number($("pitch").value),load:Number($("load").value),reverse:$("reverse").checked})});
-    const data=await response.json();if(!response.ok)throw new Error(data.error||"仿真失败");
-    previous=rows;rows=data.rows;time=0;playing=true;metrics();
-    $("status").textContent="编译成功 · 已读取最新 C++ 参数 · 15 s 仿真 / 500 Hz 控制 / 50 Hz 记录";
-  } catch(error) {$("status").className="error";$("status").textContent="编译 / 运行失败，本次结果未更新：\n"+error.message;}
-  finally {$("run").disabled=false;draw();}
+    const response=await fetch("/api/state?after="+after,{cache:"no-store",signal:AbortSignal.timeout(3000)});
+    if(!response.ok)throw new Error("HTTP "+response.status);
+    const data=await response.json();
+    if(session!==data.session) {
+      const hadCursor=after!==0;
+      session=data.session;after=0;generation=-1;rows=[];
+      if(hadCursor)return;
+    }
+    if(data.generation!==generation) {rows=[];generation=data.generation;}
+    for(const r of data.rows) {rows.push(r);after=r.seq;}
+    if(rows.length)rows=rows.filter(r=>r.time>=rows[rows.length-1].time-15).slice(-751);
+    paused=data.controls.paused;
+    // 初始化或重连时恢复服务端目标；避免覆盖用户正在拖动的滑块。
+    if(!connected && !sending && !pending) {
+      for(const key of ["yaw","pitch","load"])$(key).value=data.controls[key];
+      labels();
+    }
+    connected=true;
+    if(data.error)message="C++ 运行异常："+data.error;
+    else if(!data.running)message="C++ 控制器未运行，请重新编译";
+    else if(message.startsWith("连接中断") || message.startsWith("C++ 运行异常") || message.startsWith("C++ 控制器"))message="";
+    showStatus();draw();
+  } catch(error) {
+    connected=false;after=0;generation=-1;
+    message="连接中断，正在重连："+error.message;showStatus();
+  } finally {setTimeout(poll,50);}
 }
-$("run").onclick=run;
-$("play").onclick=()=>{if(time>=15)time=0;playing=!playing;draw();};
-$("scrub").oninput=()=>{time=Number($("scrub").value);playing=false;draw();};
-$("axis").onchange=()=>{if(rows.length)metrics();draw();};
+$("run").onclick=async()=>{
+  compiling=true;message="";$("run").disabled=true;showStatus();
+  try {await post("/api/run");message="";}
+  catch(error) {message="重新编译失败，原控制器保持运行：\n"+error.message;}
+  finally {compiling=false;$("run").disabled=false;showStatus();}
+};
+for(const key of ["yaw","pitch"])$(key).oninput=()=>{labels();sendControl({[key]:Number($(key).value)});};
+$("load").oninput=()=>{if($("load").value!=="" && $("load").validity.valid)sendControl({load:Number($("load").value)});};
+$("zero").onclick=()=>{$("yaw").value=0;$("pitch").value=0;labels();sendControl({yaw:0,pitch:0});};
+$("play").onclick=()=>sendControl({paused:!paused});
+$("reset").onclick=async()=>{try {await post("/api/reset");message="";}catch(error){message=error.message;}showStatus();};
+$("axis").onchange=draw;
 window.addEventListener("resize",draw);
-function frame(now){const delta=Math.min((now-last)/1000,.1);last=now;if(playing&&rows.length){time=Math.min(15,time+delta*Number($("speed").value));if(time>=15)playing=false;draw();}requestAnimationFrame(frame);}
-requestAnimationFrame(frame);run();
+labels();poll();

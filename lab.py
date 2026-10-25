@@ -10,6 +10,9 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
+import queue
+from collections import deque
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 import webbrowser
@@ -36,10 +39,10 @@ def compiler():
     return found
 
 
-def build():
+def build(target=EXE):
     BUILD.mkdir(exist_ok=True)
     command([compiler(), "-std=c++11", "-O2", "-Wall", "-Wextra", "-I", str(ROOT / "include"),
-             str(ROOT / "src/main.cpp"), str(ROOT / "src/tuning.cpp"), "-o", str(EXE)])
+             str(ROOT / "src/main.cpp"), str(ROOT / "src/tuning.cpp"), "-o", str(target)])
 
 
 def simulate(data):
@@ -61,12 +64,149 @@ def simulate(data):
     return {"rows": rows}
 
 
+class LiveEngine:
+    """One persistent C++ controller; HTTP threads only change commands/read telemetry."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.controls = dict(yaw=0.0, pitch=0.0, load=0.0, paused=False)
+        self.rows = deque(maxlen=751)
+        self.sequence = 0
+        self.generation = 0
+        self.session = str(time.time_ns())
+        self.reset_pending = True
+        self.error = None
+        self.process = None
+        self.worker = None
+        self.stop_event = threading.Event()
+        self.slot = 0
+
+    def control(self, data):
+        update = {}
+        for key, limit in [("yaw", 150), ("pitch", 60), ("load", 0.3)]:
+            if key in data:
+                value = float(data[key])
+                if not math.isfinite(value) or abs(value) > limit:
+                    raise ValueError(f"{key} 超出范围 ±{limit}")
+                update[key] = value
+        if "paused" in data:
+            if not isinstance(data["paused"], bool):
+                raise ValueError("paused 必须为布尔值")
+            update["paused"] = data["paused"]
+        with self.lock:
+            self.controls.update(update)
+            return dict(self.controls)
+
+    def reset(self):
+        with self.lock:
+            self.reset_pending = True
+
+    def stop(self):
+        self.stop_event.set()
+        if self.worker:
+            self.worker.join(timeout=3)
+        if self.process:
+            if self.process.poll() is None:
+                self.process.terminate()
+            self.process.wait(timeout=3)
+            self.process.stdin.close()
+            self.process.stdout.close()
+        self.process = None
+        self.worker = None
+
+    def restart(self):
+        # Compile an inactive executable first: syntax errors leave the old process running.
+        next_slot = 1 - self.slot
+        target = BUILD / (f"live_{next_slot}" + (".exe" if os.name == "nt" else ""))
+        build(target)
+        process = subprocess.Popen([str(target), "--stream"], cwd=ROOT, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   text=True, encoding="utf-8", bufsize=1)
+        output = queue.Queue()
+
+        def read_output():
+            try:
+                for line in process.stdout:
+                    output.put(line)
+            finally:
+                output.put(None)
+
+        threading.Thread(target=read_output, daemon=True).start()
+        try:
+            header = output.get(timeout=2)
+            if not header or not header.startswith("time,yaw_target,"):
+                raise RuntimeError("C++ 实时协议未就绪")
+        except (queue.Empty, RuntimeError) as error:
+            process.terminate()
+            process.wait(timeout=3)
+            process.stdin.close()
+            process.stdout.close()
+            raise RuntimeError("C++ 实时进程启动失败；旧进程保持运行") from error
+        self.stop()
+        self.slot = next_slot
+        self.process = process
+        self.stop_event = threading.Event()
+        with self.lock:
+            self.reset_pending = True
+            self.error = None
+        self.worker = threading.Thread(target=self.pump, args=(process, output, header.strip().split(",")), daemon=True)
+        self.worker.start()
+
+    def pump(self, process, output, fields):
+        deadline = time.monotonic()
+        try:
+            while not self.stop_event.is_set():
+                with self.lock:
+                    settings = dict(self.controls)
+                    reset = self.reset_pending
+                    self.reset_pending = False
+                if not settings["paused"] or reset:
+                    steps = 0 if reset else 10
+                    process.stdin.write(f"{settings['yaw']} {settings['pitch']} {settings['load']} {steps} {int(reset)}\n")
+                    process.stdin.flush()
+                    line = output.get(timeout=2)
+                    if line is None:
+                        raise RuntimeError("C++ 进程已退出，请检查代码并重新编译")
+                    values = [float(v) for v in line.strip().split(",")]
+                    if len(values) != len(fields) or not all(math.isfinite(v) for v in values):
+                        raise RuntimeError("C++ 返回了无效数据，请检查 PID 参数")
+                    row = dict(zip(fields, values))
+                    with self.lock:
+                        if reset:
+                            self.rows.clear()
+                            self.generation += 1
+                        self.sequence += 1
+                        row["seq"] = self.sequence
+                        self.rows.append(row)
+                deadline += 0.02
+                now = time.monotonic()
+                if deadline < now:
+                    deadline = now  # Do not replay a backlog after an OS scheduling stall.
+                self.stop_event.wait(max(0, deadline - now))
+        except (OSError, ValueError, RuntimeError, queue.Empty) as error:
+            with self.lock:
+                self.error = str(error) or "C++ 响应超时，请重新编译"
+
+    def state(self, after=0):
+        with self.lock:
+            return dict(rows=[r.copy() for r in self.rows if r["seq"] > after],
+                        controls=dict(self.controls), generation=self.generation, session=self.session,
+                        error=self.error, running=self.worker is not None and self.worker.is_alive())
+
+
+ENGINE = LiveEngine()
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT / "web"), **kwargs)
 
+    def log_request(self, code="-", size="-"):
+        if self.path.startswith("/api/state") and code == 200:
+            return
+        super().log_request(code, size)
+
     def do_POST(self):
-        if self.path != "/api/run":
+        if self.path not in ("/api/run", "/api/control", "/api/reset"):
             self.send_error(404)
             return
         # Only the local teaching UI may request compilation; refuse cross-origin requests.
@@ -82,19 +222,36 @@ class Handler(SimpleHTTPRequestHandler):
             data = json.loads(self.rfile.read(size))
             if not isinstance(data, dict):
                 raise ValueError("请求必须为 JSON 对象")
-            with LOCK:
-                response = simulate(data)
+            if self.path == "/api/control":
+                response = {"controls": ENGINE.control(data)}
+            elif self.path == "/api/reset":
+                ENGINE.reset()
+                response = {"ok": True}
+            else:
+                with LOCK:
+                    ENGINE.restart()
+                response = {"ok": True}
             self.reply(200, response)
         except (ValueError, TypeError, RuntimeError, OSError, subprocess.TimeoutExpired) as error:
             self.reply(400, {"error": str(error)})
 
     def do_GET(self):
-        if urlsplit(self.path).path == "/api/csv":
-            path = BUILD / "latest.csv"
-            if not path.exists():
-                self.send_error(404, "Run a simulation first")
-                return
-            payload = path.read_bytes()
+        path = urlsplit(self.path)
+        if path.path == "/api/state":
+            from urllib.parse import parse_qs
+            try:
+                after = int(parse_qs(path.query).get("after", ["0"])[0])
+                self.reply(200, ENGINE.state(after))
+            except ValueError:
+                self.reply(400, {"error": "after 必须为整数"})
+        elif path.path == "/api/csv":
+            rows = ENGINE.state()["rows"]
+            stream = io.StringIO(newline="")
+            if rows:
+                writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+                writer.writeheader()
+                writer.writerows(rows)
+            payload = stream.getvalue().encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/csv; charset=utf-8")
             self.send_header("Content-Disposition", 'attachment; filename="pid-response.csv"')
@@ -103,6 +260,10 @@ class Handler(SimpleHTTPRequestHandler):
             self.wfile.write(payload)
         else:
             super().do_GET()
+
+    def end_headers(self):
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
 
     def reply(self, status, data):
         payload = json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
@@ -138,13 +299,17 @@ if __name__ == "__main__":
         if args.test:
             test()
         else:
-            build()
+            ENGINE.restart()
             server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
             url = f"http://127.0.0.1:{args.port}"
-            print(f"PID 云台实验室：{url}\n修改 src/tuning.cpp 后，在页面点击编译并运行。Ctrl+C 退出。", flush=True)
+            print(f"PID 云台实验室：{url}\n拖动滑块实时控制；修改 src/tuning.cpp 后点击重新编译 C++。Ctrl+C 退出。", flush=True)
             if not args.no_browser:
                 webbrowser.open(url)
-            server.serve_forever()
+            try:
+                server.serve_forever()
+            finally:
+                server.server_close()
+                ENGINE.stop()
     except KeyboardInterrupt:
         pass
     except (RuntimeError, OSError, subprocess.TimeoutExpired, AssertionError) as error:

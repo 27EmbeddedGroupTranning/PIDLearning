@@ -6,34 +6,28 @@
 </head>
 <body>
 <main>
-  <header><div><span class="eyebrow">EMBEDDED SYSTEMS / CONTROL LAB 01</span><h1>让云台，稳稳追上目标。</h1><p>修改 C++ → 编译 → 观察闭环。每一次振荡，都是系统在回答你的参数。</p></div><span class="badge">500 Hz · 双轴仿真</span></header>
   <section class="toolbar" aria-label="实验设置">
-    <label>Yaw 目标 / °<input id="yaw" type="number" value="45" min="-150" max="150" step="5"></label>
-    <label>Pitch 目标 / °<input id="pitch" type="number" value="20" min="-60" max="60" step="5"></label>
-    <label>6 s 后外力矩 / N·m<input id="load" type="number" value="0.08" min="-0.3" max="0.3" step="0.02"></label>
-    <label class="check"><input id="reverse" type="checkbox">8 s 时反向目标</label>
-    <button id="run">编译并运行 C++</button>
+    <label class="angle-control"><span>Yaw 目标 <output id="yawValue">0°</output></span><input id="yaw" aria-label="Yaw 目标角度" type="range" value="0" min="-150" max="150" step="1"><span class="range-limits"><span>−150°</span><span>150°</span></span></label>
+    <label class="angle-control"><span>Pitch 目标 <output id="pitchValue">0°</output></span><input id="pitch" aria-label="Pitch 目标角度" type="range" value="0" min="-60" max="60" step="1"><span class="range-limits"><span>−60°</span><span>60°</span></span></label>
+    <label>外力矩 / N·m<input id="load" aria-label="外力矩" type="number" value="0" min="-0.3" max="0.3" step="0.02"></label>
+    <button id="zero">目标归零</button>
+    <button id="run">重新编译 C++</button>
   </section>
   <div id="status" role="status">正在准备仿真…</div>
   <section class="layout">
     <article class="panel stage"><div class="panel-title"><h2>01 / 云台姿态</h2><span>实线：实际 · 虚线：目标</span></div>
       <canvas id="gimbal" aria-label="机器人云台姿态动画，含俯视和侧视投影"></canvas>
-      <div class="transport"><button id="play">暂停</button><label>播放速度<select id="speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option></select></label><output id="clock">0.00 s</output></div>
-      <input id="scrub" aria-label="仿真时间" type="range" min="0" max="15" step="0.02" value="0">
-      <div class="events"><span>1 s · 目标阶跃</span><span>6 s · 持续负载</span><span>8 s · 可选反向</span></div>
+      <div class="transport"><button id="play">暂停仿真</button><button id="reset">重置状态</button><output id="clock">0.00 s</output></div>
       <div class="readouts"><div><small>Yaw 误差</small><strong id="yawError">—</strong></div><div><small>Pitch 误差</small><strong id="pitchError">—</strong></div><div><small>Yaw 力矩</small><strong id="torque">—</strong></div></div>
-      <p class="note">动画是 C++ 仿真数据的回放。播放速度不改变控制周期；两个转轴采用独立的惯量与阻尼模型。</p>
     </article>
     <article class="panel plots"><div class="panel-title"><h2>02 / 闭环响应</h2><select id="axis" aria-label="曲线转轴"><option value="yaw">Yaw 转轴</option><option value="pitch">Pitch 转轴</option></select></div>
-      <div class="legend"><span class="cyan">实际角度</span><span class="gold">目标角度</span><span class="muted">灰线：上次运行</span></div>
+      <div class="legend"><span class="cyan">实际角度</span><span class="gold">目标角度</span><span class="muted">最近 15 秒</span></div>
       <canvas id="response" aria-label="角度随时间变化曲线"></canvas>
       <div class="legend"><span class="cyan">P</span><span class="gold">I</span><span class="purple">D</span><span>白线：限幅后力矩</span></div>
       <canvas id="terms" aria-label="PID 各项及限幅后输出曲线"></canvas>
       <div id="metrics" class="metrics"></div>
-      <a href="/api/csv" download>下载本次 CSV 数据 ↗</a>
+      <a href="/api/csv" download>下载最近 15 秒 CSV ↗</a>
     </article>
   </section>
-  <section class="lesson"><div><span class="eyebrow">YOUR NEXT CHANGE</span><h2>打开 <code>src/tuning.cpp</code></h2><p><code>{ Kp, Ki, Kd, 力矩上限, 微分滤波时间常数, 抗积分饱和 }</code></p><p>保存文件后点击编译按钮。页面保留上一次角度曲线，方便比较。</p></div><div class="formula"><b>P</b> 看现在的误差　 <b>I</b> 累积过去的误差　 <b>D</b> 抑制变化趋势<p>目标 → 误差 → PID → 电机 / 云台 → 角度反馈 ↺</p></div></section>
-  <footer>教学模型 · 内部角度为 rad，显示角度为 ° · 操作步骤见 docs/实验手册.md</footer>
 </main><script src="app.js"></script>
 </body></html>
