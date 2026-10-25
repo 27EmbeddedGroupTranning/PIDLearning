@@ -24,9 +24,12 @@ const char* csv_header = "time,yaw_target,pitch_target,yaw,pitch,yaw_u,pitch_u,y
 
 // 持久进程协议，每行：yaw_deg pitch_deg load_Nm steps reset。
 // 网页指令经本地服务转发，每 20 ms 推进 10 个 2 ms 控制周期。
+// 双环级联：同一 2 ms tick 内先算外环 PID（角度误差 → 速度指令），
+// 再算内环 LQR（速度指令 + 实测角速度 → 力矩），最后推进物理状态。
 // 状态保存在 C++ 中；目标改变不会重置角度、速度或积分。
 int stream() {
     PID yaw_pid(yaw_gains()), pitch_pid(pitch_gains());
+    LQR yaw_lqr(yaw_lqr_params()), pitch_lqr(pitch_lqr_params());
     Axis yaw, pitch;
     long long tick = 0;
     const double dt = 0.002;
@@ -43,11 +46,16 @@ int stream() {
             throw std::runtime_error("Invalid stream command");
         if (reset) {
             yaw = Axis(); pitch = Axis(); yaw_pid.reset(); pitch_pid.reset();
+            yaw_lqr.reset(); pitch_lqr.reset();
             tick = 0; yu = pu = 0;
         }
         for (int n = 0; n < steps; ++n) {
-            yu = yaw_pid.update(radians(yt), yaw.angle, dt);
-            pu = pitch_pid.update(radians(pt), pitch.angle, dt);
+            // 外环 PID：目标角与实测角之差 → 期望角速度；内环 LQR：期望角速度与
+            // 实测角速度（内环状态量，取自 Axis）→ 电机力矩。
+            const double yaw_speed_ref = yaw_pid.update(radians(yt), yaw.angle, dt);
+            const double pitch_speed_ref = pitch_pid.update(radians(pt), pitch.angle, dt);
+            yu = yaw_lqr.update(yaw_speed_ref, yaw.velocity, dt);
+            pu = pitch_lqr.update(pitch_speed_ref, pitch.velocity, dt);
             yaw.step(yu, load, dt); pitch.step(pu, load, dt);
             ++tick;
         }
@@ -74,6 +82,7 @@ int main(int argc, char** argv) {
             std::abs(yaw_target) > 150 || std::abs(pitch_target) > 60 || std::abs(load) > 0.3)
             throw std::runtime_error("Inputs out of range");
         PID yaw_pid(yaw_gains()), pitch_pid(pitch_gains());
+        LQR yaw_lqr(yaw_lqr_params()), pitch_lqr(pitch_lqr_params());
         Axis yaw, pitch;
         const double dt = 0.002; // 固定 500 Hz 控制周期，不受浏览器播放速度影响。
         std::cout << csv_header;
@@ -84,8 +93,11 @@ int main(int argc, char** argv) {
             const double yt = t >= 1 ? radians(yaw_target) * direction : 0;
             const double pt = t >= 1 ? radians(pitch_target) * direction : 0;
             const double external = t >= 6 ? load : 0;
-            const double yu = yaw_pid.update(yt, yaw.angle, dt);
-            const double pu = pitch_pid.update(pt, pitch.angle, dt);
+            // 外环 PID 输出期望角速度，内环 LQR 据此与实测角速度解算力矩。
+            const double yaw_speed_ref = yaw_pid.update(yt, yaw.angle, dt);
+            const double pitch_speed_ref = pitch_pid.update(pt, pitch.angle, dt);
+            const double yu = yaw_lqr.update(yaw_speed_ref, yaw.velocity, dt);
+            const double pu = pitch_lqr.update(pitch_speed_ref, pitch.velocity, dt);
             // 记录当前采样时刻的角度和据此计算的力矩，再更新下一时刻的物理状态。
             if (n % 10 == 0) {
                 std::cout << t << ',' << degrees(yt) << ',' << degrees(pt) << ','

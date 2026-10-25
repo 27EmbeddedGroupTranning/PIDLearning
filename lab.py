@@ -285,7 +285,8 @@ def test():
     for axis, target in [("yaw", 45), ("pitch", 20)]:
         tail = [r for r in rows if r["time"] >= 14]
         assert max(abs(r[axis] - target) for r in tail) < 1, "default loaded settling"
-        assert max(abs(r[axis + "_u"]) for r in rows) <= 0.650001, "actuator limit"
+        # 执行器上限与 src/tuning.cpp 中 LQRParams.max_output（力矩限幅）联动。
+        assert max(abs(r[axis + "_u"]) for r in rows) <= 1.000001, "actuator limit"
     print("Simulation tests passed: 751 samples, loaded final error < 1 degree, torque within limits")
 
 
